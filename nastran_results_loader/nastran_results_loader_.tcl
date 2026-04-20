@@ -30,6 +30,13 @@ namespace eval NastranResultsLoader {
 
     # Geçerli subcase listesi (id — başlık çiftleri)
     variable subcaseData {}
+
+    # 1D element yük çıkarımı
+    variable elem1DTypeVar   "Bar Forces"
+    variable elem1DTypes     {"Bar Forces" "Beam Forces" "Rod Forces" \
+                              "Bush Forces" "Gap Forces" "Weld Forces"}
+    variable loadsOutputFile ""
+    variable extractedLoads  {}
 }
 
 # -----------------------------------------------------------------------------
@@ -58,6 +65,9 @@ proc NastranResultsLoader::BuildGUI {} {
     variable resultTypeVar
     variable statusMsg
     variable resultTypes
+    variable elem1DTypeVar
+    variable elem1DTypes
+    variable loadsOutputFile
 
     toplevel $mainWin
     wm title $mainWin "MSC Nastran Results File Loader"
@@ -170,6 +180,55 @@ proc NastranResultsLoader::BuildGUI {} {
     grid $fPost.bApply -row 2 -column 0 -columnspan 2 -pady {8 0} -sticky ew
 
     grid columnconfigure $fPost 1 -weight 1
+
+    # ── 1D Element Yük Çıkarımı ─────────────────────────────────────────────
+    set fExtr [labelframe $mainWin.fExtr \
+        -text " 4. 1D Element Yük Çıkarımı " \
+        -font {Helvetica 9 bold} -padx 8 -pady 6]
+    pack $fExtr -fill x -padx 6 -pady 4
+
+    label $fExtr.lType -text "Sonuç Tipi:"
+    grid $fExtr.lType -row 0 -column 0 -sticky w -pady 2
+
+    ttk::combobox $fExtr.cbType \
+        -textvariable NastranResultsLoader::elem1DTypeVar \
+        -values       $elem1DTypes \
+        -state readonly \
+        -width 44
+    grid $fExtr.cbType -row 0 -column 1 -sticky ew -padx {4 0}
+
+    label $fExtr.lParams \
+        -text "Corners: Kapalı  |  Avg Yöntemi: None  |  Sistem: Elemental" \
+        -font {Helvetica 8 italic} \
+        -fg #555555
+    grid $fExtr.lParams -row 1 -column 0 -columnspan 2 -sticky w -pady {2 4}
+
+    frame $fExtr.fOut
+    grid $fExtr.fOut -row 2 -column 0 -columnspan 2 -sticky ew -pady {0 4}
+
+    label $fExtr.fOut.lFile -text "CSV Çıktısı (opsiyonel):"
+    pack $fExtr.fOut.lFile -side left
+
+    entry $fExtr.fOut.eFile \
+        -textvariable NastranResultsLoader::loadsOutputFile \
+        -width 28 -relief sunken
+    pack $fExtr.fOut.eFile -side left -expand 1 -fill x -padx {4 4}
+
+    button $fExtr.fOut.bBrowse \
+        -text "Gözat..." \
+        -width 8 \
+        -command NastranResultsLoader::BrowseOutputFile
+    pack $fExtr.fOut.bBrowse -side left
+
+    button $fExtr.bExtract \
+        -text "1D Element Yüklerini Çıkar" \
+        -bg #7b3f00 -fg white \
+        -activebackground #5a2d00 \
+        -font {Helvetica 9 bold} \
+        -command NastranResultsLoader::Extract1DElementLoads
+    grid $fExtr.bExtract -row 3 -column 0 -columnspan 2 -pady {0 2} -sticky ew
+
+    grid columnconfigure $fExtr 1 -weight 1
 
     # ── Durum Çubuğu ─────────────────────────────────────────────────────────
     set fStatus [frame $mainWin.fStatus -relief sunken -bd 1 -bg #f0f0f0]
@@ -438,4 +497,357 @@ proc NastranResultsLoader::CenterWindow {w} {
     set x  [expr {($sw - $ww) / 2}]
     set y  [expr {($sh - $wh) / 2}]
     wm geometry $w "+${x}+${y}"
+}
+
+# -----------------------------------------------------------------------------
+# BrowseOutputFile — CSV çıktı dosyası kayıt diyaloğu
+# -----------------------------------------------------------------------------
+proc NastranResultsLoader::BrowseOutputFile {} {
+    variable loadsOutputFile
+
+    set types {
+        {"CSV Dosyası"   {.csv}}
+        {"Metin Dosyası" {.txt}}
+        {"Tüm Dosyalar"   *}
+    }
+    set f [tk_getSaveFile \
+        -title            "CSV Çıktı Dosyası Seç" \
+        -filetypes        $types \
+        -defaultextension ".csv" \
+        -initialdir       [GetInitialDir $loadsOutputFile]]
+
+    if {$f ne ""} {
+        set loadsOutputFile $f
+        SetStatus "CSV çıktı dosyası: [file tail $f]"
+    }
+}
+
+# -----------------------------------------------------------------------------
+# GetSubcaseID — Seçili subcase etiketinden numerik ID döndürür
+# -----------------------------------------------------------------------------
+proc NastranResultsLoader::GetSubcaseID {} {
+    variable subcaseVar
+    variable subcaseData
+
+    if {$subcaseVar eq "" || [llength $subcaseData] == 0} {
+        return ""
+    }
+    foreach pair $subcaseData {
+        set id [lindex $pair 0]
+        if {[string match "*SC $id*" $subcaseVar]} {
+            return $id
+        }
+    }
+    return [lindex [lindex $subcaseData 0] 0]
+}
+
+# -----------------------------------------------------------------------------
+# Get1DElements — Modeldeki tüm 1D element ID'lerini döndürür
+# -----------------------------------------------------------------------------
+proc NastranResultsLoader::Get1DElements {} {
+    set cfgs1D {cbar cbeam crod ctube conrod cbush cgap cweld crbe2 crbe3}
+    set elemIDs {}
+
+    # Yöntem 1: config bazlı toplu mark
+    set rc [catch {
+        eval [list *createmark elems 1 "by config"] $cfgs1D
+        set elemIDs [hm_getmark elems 1]
+    }]
+
+    # Yöntem 2: tüm elementleri al, config alanına göre filtrele
+    if {$rc != 0 || [llength $elemIDs] == 0} {
+        set elemIDs {}
+        catch {
+            *createmark elems 1 "all"
+            foreach eid [hm_getmark elems 1] {
+                catch {
+                    set cfg [string tolower [hm_getvalue elem id=$eid dataname=config]]
+                    if {[lsearch -exact $cfgs1D $cfg] >= 0} {
+                        lappend elemIDs $eid
+                    }
+                }
+            }
+        }
+    }
+
+    # Yöntem 3: HyperMesh element-tip markeri
+    if {[llength $elemIDs] == 0} {
+        catch {
+            *elementtypemark elems 1 "1d"
+            set elemIDs [hm_getmark elems 1]
+        }
+    }
+
+    return $elemIDs
+}
+
+# -----------------------------------------------------------------------------
+# Extract1DElementLoads — Ana çıkarım prosedürü
+# Sabit parametreler: Corners=False  AvgMethod=None  System=Elemental
+# -----------------------------------------------------------------------------
+proc NastranResultsLoader::Extract1DElementLoads {} {
+    variable elem1DTypeVar
+    variable loadsOutputFile
+    variable extractedLoads
+    variable mainWin
+
+    set subcaseID [GetSubcaseID]
+    if {$subcaseID eq ""} {
+        tk_messageBox -icon warning -title "Uyarı" \
+            -message "Lütfen önce sonuç dosyasını yükleyin ve bir subcase seçin." \
+            -parent $mainWin
+        return
+    }
+
+    SetStatus "1D elementler aranıyor..."
+    set elemIDs [Get1DElements]
+
+    if {[llength $elemIDs] == 0} {
+        tk_messageBox -icon warning -title "1D Element Bulunamadı" \
+            -message "Modelde 1D element (CBAR, CBEAM, CROD vb.) bulunamadı.\nÖnce BDF dosyasını yükleyin." \
+            -parent $mainWin
+        SetStatus "1D element bulunamadı."
+        return
+    }
+
+    SetStatus "SC $subcaseID — $elem1DTypeVar sorgulanıyor ([llength $elemIDs] element)..."
+
+    set extractedLoads {}
+    set queryErr "Tüm API yöntemleri başarısız."
+
+    # Yöntem 1: hm_getresultvalues (modern HM API)
+    if {[catch {
+        set raw [hm_getresultvalues \
+            -subcase   $subcaseID \
+            -type      $elem1DTypeVar \
+            -system    "Elemental" \
+            -averaging "None" \
+            -corners   0 \
+            -entity    "elems" \
+            -ids       $elemIDs]
+        set extractedLoads [ParseQueryResult $raw $elemIDs]
+    } queryErr]} {
+
+        # Yöntem 2: hm_result query (alternatif modern API)
+        if {[catch {
+            set raw [hm_result query \
+                -subcase   $subcaseID \
+                -type      $elem1DTypeVar \
+                -system    "Elemental" \
+                -averaging "None" \
+                -corners   0 \
+                -entities  "elems" \
+                -ids       $elemIDs]
+            set extractedLoads [ParseQueryResult $raw $elemIDs]
+        } queryErr]} {
+
+            # Yöntem 3: applyresult + hm_getvalue (legacy element-by-element)
+            catch {
+                set applyErr ""
+                if {[catch {
+                    hm_result applyresult \
+                        -subcase   $subcaseID \
+                        -type      $elem1DTypeVar \
+                        -system    "Elemental" \
+                        -averaging "None" \
+                        -corners   0
+                } applyErr]} {
+                    *post_applyresult $subcaseID $elem1DTypeVar
+                }
+
+                set tmp {}
+                foreach eid $elemIDs {
+                    set row [list EID $eid]
+                    foreach comp {X Y Z Mag} {
+                        set val "N/A"
+                        catch { set val [hm_getvalue elem id=$eid dataname=Result$comp] }
+                        if {$val eq "N/A"} {
+                            catch { set val [hm_getvalue elem id=$eid dataname=$comp] }
+                        }
+                        lappend row $comp $val
+                    }
+                    lappend tmp $row
+                }
+                if {[llength $tmp] > 0} {
+                    set extractedLoads $tmp
+                    set queryErr ""
+                }
+            }
+        }
+    }
+
+    if {[llength $extractedLoads] == 0} {
+        tk_messageBox -icon error -title "Sorgu Hatası" \
+            -message "1D element yükleri alınamadı.\n\n$queryErr\n\nSonuç dosyasının yüklü ve subcase seçili olduğundan emin olun." \
+            -parent $mainWin
+        SetStatus "HATA: 1D yük çıkarımı başarısız."
+        return
+    }
+
+    SetStatus "[llength $extractedLoads] element için yük alındı — SC $subcaseID / $elem1DTypeVar"
+    ShowExtractedLoads $extractedLoads $subcaseID
+
+    if {$loadsOutputFile ne ""} {
+        ExportLoadsToCSV $subcaseID
+    }
+}
+
+# -----------------------------------------------------------------------------
+# ParseQueryResult — API ham verisini standart {EID x X x Y x Z x Mag x} listesine çevirir
+# -----------------------------------------------------------------------------
+proc NastranResultsLoader::ParseQueryResult {rawData elemIDs} {
+    if {$rawData eq "" || $rawData eq {}} { return {} }
+
+    set results {}
+
+    # Format 1: liste elemanları {elemID {comp val ...}} çiftiyse
+    set first [lindex $rawData 0]
+    if {[llength $first] == 2 && [llength [lindex $first 1]] > 1} {
+        foreach item $rawData {
+            set eid  [lindex $item 0]
+            set vals [lindex $item 1]
+            set row  [list EID $eid]
+            foreach {comp val} $vals { lappend row $comp $val }
+            lappend results $row
+        }
+        return $results
+    }
+
+    # Format 2: düz sayı dizisi — elemIDs ile stride'a böl
+    set nElems [llength $elemIDs]
+    set nVals  [llength $rawData]
+    if {$nElems == 0} { return {} }
+    set stride [expr {$nVals / $nElems}]
+    if {$stride < 1} { set stride 1 }
+
+    set i 0
+    foreach eid $elemIDs {
+        set off [expr {$i * $stride}]
+        set row [list EID $eid]
+        foreach comp {X Y Z Mag} idx {0 1 2 3} {
+            set vidx [expr {$off + $idx}]
+            lappend row $comp [expr {$vidx < $nVals ? [lindex $rawData $vidx] : "N/A"}]
+        }
+        lappend results $row
+        incr i
+    }
+    return $results
+}
+
+# -----------------------------------------------------------------------------
+# ShowExtractedLoads — Sonuçları tablo penceresinde gösterir
+# -----------------------------------------------------------------------------
+proc NastranResultsLoader::ShowExtractedLoads {data subcaseID} {
+    variable elem1DTypeVar
+    variable loadsOutputFile
+
+    set w ".loads1DResult"
+    if {[winfo exists $w]} { destroy $w }
+
+    toplevel $w
+    wm title $w "1D Element Yükleri — SC $subcaseID / $elem1DTypeVar"
+    wm resizable $w 1 1
+
+    label $w.lHdr \
+        -text "SC $subcaseID  |  $elem1DTypeVar  |  Sistem: Elemental  |  Corners: Kapalı  |  Avg: None" \
+        -font {Helvetica 9 bold} -bg #2b4f7a -fg white -padx 8 -pady 4
+    pack $w.lHdr -fill x
+
+    frame $w.fTbl
+    pack $w.fTbl -fill both -expand 1 -padx 4 -pady 4
+
+    text $w.fTbl.txt \
+        -width 72 -height 28 \
+        -font {Courier 9} \
+        -yscrollcommand [list $w.fTbl.sb set] \
+        -xscrollcommand [list $w.fTbl.sbx set]
+    scrollbar $w.fTbl.sb  -orient vertical   -command [list $w.fTbl.txt yview]
+    scrollbar $w.fTbl.sbx -orient horizontal -command [list $w.fTbl.txt xview]
+
+    grid $w.fTbl.txt -row 0 -column 0 -sticky nsew
+    grid $w.fTbl.sb  -row 0 -column 1 -sticky ns
+    grid $w.fTbl.sbx -row 1 -column 0 -sticky ew
+    grid rowconfigure    $w.fTbl 0 -weight 1
+    grid columnconfigure $w.fTbl 0 -weight 1
+
+    set hdr [format "%-10s  %16s  %16s  %16s  %16s" ElemID X Y Z Mag]
+    $w.fTbl.txt insert end "$hdr\n[string repeat - 78]\n"
+
+    foreach row $data {
+        set eid [Get1DRowVal $row EID]
+        set vx  [Fmt1DVal    [Get1DRowVal $row X]]
+        set vy  [Fmt1DVal    [Get1DRowVal $row Y]]
+        set vz  [Fmt1DVal    [Get1DRowVal $row Z]]
+        set vm  [Fmt1DVal    [Get1DRowVal $row Mag]]
+        $w.fTbl.txt insert end \
+            "[format {%-10s  %16s  %16s  %16s  %16s} $eid $vx $vy $vz $vm]\n"
+    }
+    $w.fTbl.txt configure -state disabled
+
+    if {$loadsOutputFile ne ""} {
+        set csvInfo "CSV: [file tail $loadsOutputFile]"
+    } else {
+        set csvInfo "CSV kaydedilmedi"
+    }
+    label $w.lCount \
+        -text "[llength $data] element  |  $csvInfo" \
+        -font {Helvetica 8} -fg #444444
+    pack $w.lCount -pady {0 2}
+
+    button $w.bClose -text "Kapat" -width 10 -command [list destroy $w]
+    pack $w.bClose -pady {0 6}
+
+    CenterWindow $w
+}
+
+# -----------------------------------------------------------------------------
+# ExportLoadsToCSV — Çıkarılan yükleri CSV dosyasına yazar
+# -----------------------------------------------------------------------------
+proc NastranResultsLoader::ExportLoadsToCSV {subcaseID} {
+    variable extractedLoads
+    variable loadsOutputFile
+    variable elem1DTypeVar
+    variable mainWin
+
+    if {[llength $extractedLoads] == 0} {
+        SetStatus "CSV için veri yok."
+        return
+    }
+
+    set rc [catch {
+        set fh [open $loadsOutputFile w]
+        puts $fh "# 1D Element Loads — HyperMesh 2019.1 Aerospace"
+        puts $fh "# Subcase: $subcaseID"
+        puts $fh "# Result Type: $elem1DTypeVar"
+        puts $fh "# System: Elemental | Avg Method: None | Corners: False"
+        puts $fh "ElemID,X,Y,Z,Mag"
+        foreach row $extractedLoads {
+            puts $fh "[Get1DRowVal $row EID],[Get1DRowVal $row X],[Get1DRowVal $row Y],[Get1DRowVal $row Z],[Get1DRowVal $row Mag]"
+        }
+        close $fh
+        SetStatus "CSV kaydedildi: [file tail $loadsOutputFile] ([llength $extractedLoads] element)"
+    } err]
+
+    if {$rc != 0} {
+        tk_messageBox -icon error -title "CSV Kayıt Hatası" \
+            -message "Dosya yazılamadı:\n$err" \
+            -parent $mainWin
+        SetStatus "HATA: CSV kaydedilemedi."
+    }
+}
+
+# -----------------------------------------------------------------------------
+# Yardımcı prosedürler — 1D yük çıkarımı
+# -----------------------------------------------------------------------------
+proc NastranResultsLoader::Get1DRowVal {row key} {
+    foreach {k v} $row {
+        if {$k eq $key} { return $v }
+    }
+    return "N/A"
+}
+
+proc NastranResultsLoader::Fmt1DVal {val} {
+    if {$val eq "N/A"} { return "N/A" }
+    if {[catch {set s [format "%.6e" $val]}]} { return $val }
+    return $s
 }
