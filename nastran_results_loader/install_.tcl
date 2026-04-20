@@ -16,7 +16,7 @@
 
 # Loader script'in bulunduğu dizini belirle
 set _nrl_dir [file dirname [file normalize [info script]]]
-set _nrl_script [file join $_nrl_dir nastran_results_loader.tcl]
+set _nrl_script [file join $_nrl_dir nastran_results_loader_.tcl]
 
 # Ana tool script'ini source et
 if {[file exists $_nrl_script]} {
